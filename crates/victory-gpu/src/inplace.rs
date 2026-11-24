@@ -74,11 +74,22 @@ pub(crate) fn probe_level() -> u8 {
 /// reserved, which the host refuses, and what a view shows changes when
 /// the title maps pages.
 ///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
+/// What it assumes: nothing reads title memory that a submission not yet run
+/// writes through a placed buffer. With every submission waited for (the
+/// default) that holds; with `VICTORY_LATE_WAIT`, or the relay, it does not,
+/// because the flights know shader writes only by the ranges copies declare
+/// and a placed buffer has no copy. [`place_for`] therefore refuses to place
+/// anything then and the caller makes a copy, which is correct and is the
+/// only cost; the refusals are counted in [`STATS`] and warned about once.
+///
+/// Stage 1 was exempt from that rule on the argument that a window outside
+/// buffers is a copy. It is not: a placed window is a `Shadow` with `place`
+/// set, and `gpu_writes`, `writing` and `copy_back_with` all return early on
+/// that, so nothing declares its writes to the flights either. Whether a
+/// shader ever writes one (the placed buffer carries
+/// `ALLOW_UNORDERED_ACCESS`, and the root-UAV path takes any such buffer) is
+/// not something this tree can settle, so both stages are refused together
+/// rather than keeping an exemption whose reason the code contradicts.
 ///
 /// shortcut: while a window is in place the title cannot decommit, free
 /// or protect its pages (the call fails with error 87; the probe shows
@@ -142,11 +153,20 @@ fn try_reserve(bytes: u64, limit: u64) -> bool {
 }
 
 /// Gives back what [`try_reserve_at`] took. Releasing more than was ever
-/// reserved would wrap the counter and turn the budget off for the rest of
-/// the run, so it trips here instead.
+/// reserved would wrap the counter, and a wrapped counter refuses every
+/// reservation for the rest of the run -- the feature silently off, which is
+/// the direction that looks healthy. So the subtraction is checked in every
+/// build, and a mismatch leaves the counter where it was and says so.
 fn release_at(count: &AtomicU64, bytes: u64) {
-    let before = count.fetch_sub(bytes, Ordering::Relaxed);
-    debug_assert!(before >= bytes, "released {bytes} of {before} reserved");
+    if count
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(bytes))
+        .is_err()
+    {
+        tracing::warn!(
+            bytes,
+            "releasing more of the in-place budget than was ever reserved"
+        );
+    }
 }
 
 /// [`release_at`] on the process's budget.
@@ -155,10 +175,11 @@ fn release(bytes: u64) {
 }
 
 /// In place now: windows and their bytes, title buffers and their bytes;
-/// then, since the start: asks turned down because the memory is a view
-/// or not private memory committed whole, because the host refused,
-/// because of [`most`]; what was let go because its memory changed; and
-/// title buffers copied instead because late waits are on.
+/// then, since the start: asks turned down before the host was asked (the
+/// memory is a view, not private memory committed whole, or a span the
+/// address space cannot hold), refused by the host, over [`most`]; what was
+/// let go because its memory changed; and asks refused because late waits
+/// are on.
 static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// A buffer placed over title memory, and its heap.
@@ -209,11 +230,11 @@ impl Switches {
         }
     }
 
-    /// Whether title memory this is a window outside buffers (`true`) or a
-    /// title buffer, under late waits. The rule on its own, so both its
-    /// directions can be read in one place and asserted.
-    fn refuses_late_wait(self, window: bool) -> bool {
-        !window && self.late
+    /// Whether title memory may be placed at all under these switches. With
+    /// late waits nothing may: see [`level`]. The rule on its own, so it can
+    /// be read in one place and asserted.
+    fn refuses_in_place(self) -> bool {
+        self.late
     }
 }
 
@@ -235,27 +256,30 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
         STATS[4].fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    // Stage 2's assumption, enforced instead of only written down (`level`):
+    // The assumption [`level`] states, enforced instead of only written down:
     // nothing reads title memory that a submission not yet run writes
     // through a placed buffer. With every submission waited for that holds;
     // with late waits -- `VICTORY_LATE_WAIT`, and the relay, which
     // `late_stage` counts as stage 3 -- the flights know shader writes only
-    // by the ranges copies declare, so a title buffer in place would be read
-    // older than the GPU left it. A copy is the correct path, and the only
-    // cost. A window outside buffers is safe either way: it *is* a copy, so
-    // the flights know its writes.
-    if switches.refuses_late_wait(window) {
+    // by the ranges copies declare, and a placed buffer has no copy to
+    // declare them from. A copy is the correct path, and the only cost.
+    if switches.refuses_in_place() {
         if STATS[8].fetch_add(1, Ordering::Relaxed) == 0 {
             tracing::warn!(
-                "VICTORY_INPLACE=2 cannot run with VICTORY_LATE_WAIT or VICTORY_RELAY: a submission not yet run writes through a placed buffer that the flights do not track. Title buffers are copied instead; windows outside buffers stay in place."
+                "VICTORY_INPLACE cannot run with VICTORY_LATE_WAIT or VICTORY_RELAY: the flights track shader writes by the ranges copies declare, and memory placed in place has no copy to declare them from. Nothing is placed; buffers and windows are copied instead."
             );
         }
         return None;
     }
     // The 64 KiB pages that hold it are what the host locks, so those are the
     // bytes the budget counts -- not the title's length, which is up to one
-    // page shorter.
-    let (_, locked) = aligned_span(start, len)?;
+    // page shorter. A span the address space cannot hold is an ask that came
+    // to nothing without the host being asked, counted where the cover
+    // refusal is counted.
+    let Some((_, locked)) = aligned_span(start, len) else {
+        STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     if !try_reserve(locked, most()) {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
@@ -289,8 +313,12 @@ fn place_for_with(switches: Switches, start: u64, len: u64, window: bool) -> Opt
 /// What [`place_for`] gave is gone: `start` and `len` are the ones it was
 /// placed with, so the same pages are given back to the budget.
 pub(crate) fn gone(window: bool, start: u64, len: u64) {
-    // Placed memory always had a span that could be rounded up; one that
-    // could not was never reserved, and counted nothing.
+    // Unreachable: placed memory always had a span that could be rounded up,
+    // checked before the reservation and again in `place_part`. Kept rather
+    // than an `expect`, which would unwind out of a `Drop`. Were it reached
+    // it would give back no budget and leave the point-in-time counters
+    // standing too; both are consequences of an unrounded span being one the
+    // address space cannot hold, which cannot have been placed.
     let Some((_, locked)) = aligned_span(start, len) else {
         return;
     };
@@ -325,7 +353,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} title buffers copied because late waits are on (VICTORY_INPLACE=2 cannot run with them)",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} refused because late waits are on (VICTORY_INPLACE cannot run with VICTORY_LATE_WAIT or VICTORY_RELAY)",
         s[0],
         s[1] >> 20,
         s[2],
@@ -1508,33 +1536,44 @@ mod tests {
         // A claim the counter cannot hold is refused, not wrapped.
         count.store(u64::MAX - 1, Ordering::Relaxed);
         assert!(!try_reserve_at(&count, 4, u64::MAX));
+        // A release of more than was reserved leaves the counter where it was
+        // rather than wrapping it: wrapped, it would refuse every reservation
+        // for the rest of the run and the feature would read as working.
+        count.store(0, Ordering::Relaxed);
+        release_at(&count, K64 as u64);
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(try_reserve_at(&count, K64 as u64, limit), "still usable after it");
     }
 
-    /// Stage 2 assumes nothing reads title memory that a submission not yet
-    /// run writes through a placed buffer, which late waits break. A title
-    /// buffer is refused there; a window outside buffers is not, being a
-    /// copy the flights already account for.
+    /// Late waits break the assumption [`level`] states, and a placed buffer
+    /// cannot declare its writes to the flights -- not a title buffer, and
+    /// not a window either, since a placed window is a `Shadow` with `place`
+    /// set and every write-declaring path returns early on that. So nothing
+    /// is placed, both kinds are refused, and both are counted.
     ///
-    /// Mutation runs 2026-11-25, both restored: `refuses_late_wait` losing
-    /// its `!window` fails the truth table, and the guard removed from
+    /// Mutation runs 2026-11-25, both restored: `refuses_in_place` returning
+    /// `false` fails the rule assertions below, and the guard removed from
     /// `place_for_with` leaves the counted refusal unraised, which the
-    /// counter assertion catches where the `None` alone would not.
+    /// counter assertions catch where the `None` alone would not.
     #[test]
-    fn late_waits_refuse_a_title_buffer_in_place_but_not_a_window() {
+    fn late_waits_refuse_every_placement_and_count_it() {
         let switches = |level, late| Switches { level, late };
-        // The rule itself, which knows nothing of the stages: a window is a
-        // copy the flights account for, a title buffer is not.
-        assert!(switches(2, true).refuses_late_wait(false));
-        assert!(!switches(2, true).refuses_late_wait(true), "a window is a copy");
-        assert!(!switches(2, false).refuses_late_wait(false));
+        assert!(switches(2, true).refuses_in_place());
+        assert!(!switches(2, false).refuses_in_place());
+        // The timeoutless low address holds nothing the runtime reported as a
+        // view, which the guard is reached past.
+        assert_eq!(cover(0x1000, 2 * K64), Cover::None, "the test's own address");
 
-        // Refused, counted, and nothing asked of the host.
+        // A title buffer and a window: refused, counted, and nothing asked of
+        // the host.
+        for window in [false, true] {
+            let before = STATS[8].load(Ordering::Relaxed);
+            assert!(place_for_with(switches(2, true), 0x1000, 2 * K64 as u64, window).is_none());
+            assert_eq!(STATS[8].load(Ordering::Relaxed), before + 1, "counted, window {window}");
+        }
+        // Below stage 1 the question does not arise, and nothing is counted.
         let before = STATS[8].load(Ordering::Relaxed);
-        assert!(place_for_with(switches(2, true), 0x1000, 2 * K64 as u64, false).is_none());
-        assert_eq!(STATS[8].load(Ordering::Relaxed), before + 1, "the refusal is counted");
-        // Below stage 2 the question does not arise, and nothing is counted.
-        let before = STATS[8].load(Ordering::Relaxed);
-        assert!(place_for_with(switches(1, true), 0x1000, 2 * K64 as u64, false).is_none());
+        assert!(place_for_with(switches(0, true), 0x1000, 2 * K64 as u64, false).is_none());
         assert_eq!(STATS[8].load(Ordering::Relaxed), before, "not counted");
     }
 
