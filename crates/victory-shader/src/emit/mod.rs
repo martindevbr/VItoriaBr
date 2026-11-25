@@ -1228,6 +1228,71 @@ mod tests {
         assert_eq!(sample[4 + 1], 1, "PSInfo.SampleFrequency");
     }
 
+    /// A primitive-ordered pixel shader (POPS): it takes the packer bits of
+    /// the collision wave id the hardware loads after the system SGPRs,
+    /// writes them to `HW_REG_POPS_PACKER` and adds `src_pops_exiting_wave_id`
+    /// (the wait for overlapping waves). Translated as the first wave of its
+    /// ordered section (the id and the exiting id read 0, the packer write is
+    /// dropped; its UAVs become rasterizer-ordered views); it was refused for
+    /// "a hardware SGPR input".
+    #[test]
+    fn primitive_ordered_pixel_shaders_translate_without_ordering() {
+        let words = [
+            0x9381_FF12u32, // s_bfe_u32 s1, s18, 0x0002001c (packer, bits 28-29)
+            0x0002_001C,
+            0xB981_1019, // s_setreg_b32 hwreg(HW_REG_POPS_PACKER, 0, 3), s1
+            0x8102_01EF, // s_add_i32 s2, src_pops_exiting_wave_id, s1
+            0x7E04_0202, // v_mov_b32 v2, s2
+            0xF800_180F,
+            0x0202_0202, // exp mrt0, v2, v2, v2, v2 done vm
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Ps,
+            wave64: true,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: crate::native::StageIo::Ps {
+                inputs: vec![],
+                input_addr: 1 << 1,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::container::signature(
+            &[SigElement {
+                name: "SV_Target".into(),
+                index: 0,
+                kind: 16,
+                comp: 9,
+                interp: 0,
+                row: Some(0),
+                col: 0,
+                cols: 4,
+                usage: 15,
+                half: false,
+            }],
+            false,
+        );
+        let isg1 = super::container::signature(&[], true);
+        let bytes = crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
+        let c = super::Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
+        assert!(p.inputs.iter().any(|&(r, _)| r == crate::ir::Reg::S(18)), "the collision wave id is an input");
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let out = super::emit(&c, &native, &p, &st, &io, &res).expect("a POPS pixel shader translates");
+        #[cfg(windows)]
+        if let Ok(mut v) =
+            super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+        {
+            v.validate(&mut out.dxil.clone()).unwrap();
+        }
+    }
+
     /// A pixel shader reading channel z of an input whose element starts at
     /// w. Looking the channel up subtracted the element's first channel
     /// before checking the channel lies in it, so in a build with overflow
