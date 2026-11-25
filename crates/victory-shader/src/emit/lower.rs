@@ -60,8 +60,6 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
-    /// Bit n: immediate sampler n is used for comparisons.
-    pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
@@ -69,7 +67,10 @@ pub(crate) struct Lowered {
     /// A translated store or atomic can write through the guest page directory.
     pub writes_guest_memory: bool,
     pub user_data: Vec<UserData>,
-    pub samplers: Vec<[u32; 4]>,
+    /// Immediate samplers in slot order: their four words, and whether the
+    /// slot is a comparison sampler (a sampler used both ways holds two
+    /// slots, one for each way).
+    pub samplers: Vec<([u32; 4], bool)>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
     /// Heap handles made with a non-uniform index.
@@ -254,7 +255,7 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
-    samplers: Vec<[u32; 4]>,
+    samplers: Vec<([u32; 4], bool)>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
@@ -2542,11 +2543,9 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
-        let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
-            cmp_samplers,
             root_cbvs,
             root_srvs,
             root_uavs,
@@ -6723,18 +6722,23 @@ impl<'a> Lower<'a> {
                     .get(..4)
                     .and_then(|w| w.try_into().ok())
                     .ok_or("a sampler constant")?;
-                let n = match self.samplers.iter().position(|w| *w == words) {
+                // A comparison use needs a comparison sampler on the host
+                // (the DXIL validator requires the kinds to match), so a
+                // sampler used both ways gets one slot for each way.
+                let cmp = props.0 & 0x8000 != 0;
+                let n = match self.samplers.iter().position(|&(w, c)| w == words && c == cmp) {
                     Some(n) => n,
                     None => {
-                        self.samplers.push(words);
+                        self.samplers.push((words, cmp));
                         self.samplers.len() - 1
                     }
                 };
-                if props.0 & 0x8000 != 0 {
-                    // shortcut: one sampler used with and without comparison
-                    // would need two static samplers; it becomes a comparison one.
-                    self.s.cmp_samplers |= 1 << n;
-                }
+                let bit = 1 << n;
+                self.s.cmp_samplers = if cmp {
+                    self.s.cmp_samplers | bit
+                } else {
+                    self.s.cmp_samplers & !bit
+                };
                 Ok(self.s.sampler_handle(self.cur, n as u32))
             }
             Source::Constant(_) => Err("a constant resource descriptor"),
@@ -6795,8 +6799,9 @@ impl<'a> Lower<'a> {
                 // The static samplers of the range: both registered now, so
                 // they are consecutive whatever the program used before.
                 let lo = self.samplers.len() as u32;
+                let cmp = props.0 & 0x8000 != 0;
                 for w in words {
-                    self.samplers.push(w);
+                    self.samplers.push((w, cmp));
                 }
                 if props.0 & 0x8000 != 0 {
                     for n in lo..lo + args.len() as u32 {

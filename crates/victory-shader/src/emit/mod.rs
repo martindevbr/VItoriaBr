@@ -721,16 +721,15 @@ fn emit_program(
         static_samplers: l
             .samplers
             .iter()
-            .enumerate()
-            .map(|(n, &w)| {
+            .map(|&(w, cmp)| {
                 let mut s = StaticSampler::from_words(w);
-                if l.cmp_samplers >> n & 1 != 0 {
+                if cmp {
                     s.filter |= 0x80;
                 }
                 s
             })
             .collect(),
-        samplers: l.samplers,
+        samplers: l.samplers.iter().map(|&(w, _)| w).collect(),
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
