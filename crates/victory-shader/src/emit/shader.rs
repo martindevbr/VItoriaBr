@@ -1106,6 +1106,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             writes_guest_memory: false,
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let data = [0x1020_3040, 0x100, 320, 20, 0x5060_7080, 0x200, 768, 24];
         let (root, pipeline) = host.compute_pipeline(&shader).expect("view table pipeline");

@@ -86,6 +86,7 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         written_root_uavs: Vec::new(),
         writes_guest_memory: false,
         root_indexed_views: Vec::new(),
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
